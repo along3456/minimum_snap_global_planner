@@ -225,54 +225,7 @@ s.t. r(0) = p₀, r(T) = pₙ
      连续性约束
 ```
 
-## 故障排除
-
-### 问题：规划失败
-**可能原因**:
-- 航点在障碍物中
-- 起点到航点之间无可行路径
-- costmap未正确配置
-
-**解决方法**:
-- 检查RViz中的costmap可视化
-- 确保航点在自由空间中
-- 增加costmap的inflation_radius
-
-### 问题：轨迹不够平滑
-**解决方法**:
-- 减小`downsample_resolution`（增加航点密度）
-- 增加`polynomial_order`到4
-- 检查A*路径是否合理
-
-### 问题：编译错误
-**常见问题**:
-- 缺少依赖：安装所有ROS导航相关包
-- Eigen版本：确保Eigen3已安装
-- PCL版本：确保PCL 1.8+已安装
-
-## 性能优化建议
-
-1. **降采样分辨率**: 根据环境复杂度调整
-   - 简单环境：0.5-1.0米
-   - 复杂环境：0.2-0.5米
-
-2. **多项式阶数**: 
-   - 地面机器人：order=2或3
-   - 飞行器：order=3或4
-
-3. **Costmap分辨率**: 
-   - 与A*搜索效率直接相关
-   - 推荐：0.05米
-
-## 引用
-
-如果使用本项目，请引用：
-
-```
-Mellinger, D., & Kumar, V. (2011).
-Minimum snap trajectory generation and control for quadrotors.
-IEEE International Conference on Robotics and Automation (ICRA).
-```
+## 致谢
 
 原始Minimum Snap实现：
 ```
@@ -283,11 +236,6 @@ https://blog.csdn.net/u011341856/article/details/121861930
 ## 许可证
 
 BSD License
-
-## 作者
-
-- 原始实现：Zhang Zhimeng
-- Move Base集成与航点支持：基于原项目修改
 
 ## 更新日志
 
@@ -300,13 +248,5 @@ BSD License
 - ✅ 路径降采样功能
 - ✅ 完整的配置文件和文档
 
-## 贡献
 
-欢迎提交Issue和Pull Request！
-
-## 相关资源
-
-- [ROS Navigation Stack](http://wiki.ros.org/navigation)
-- [move_base](http://wiki.ros.org/move_base)
-- [Writing a Global Path Planner Plugin](http://wiki.ros.org/navigation/Tutorials/Writing%20A%20Global%20Path%20Planner%20As%20Plugin%20in%20ROS)
 
