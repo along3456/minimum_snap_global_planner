@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>waypoint_rviz_tools</name>
+  <version>1.0.0</version>
+  <description>
+    RViz tools for interactive waypoint selection
+  </description>
+
+  <maintainer email="zhangzhimeng@turingvideo.net">Zhang Zhimeng</maintainer>
+  <license>BSD</license>
+  <url>http://ros.org/wiki/waypoint_rviz_tools</url>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>rviz</depend>
+  <depend>roscpp</depend>
+  <depend>geometry_msgs</depend>
+  
+  <build_depend>qtbase5-dev</build_depend>
+  
+  <exec_depend>libqt5-core</exec_depend>
+  <exec_depend>libqt5-gui</exec_depend>
+  <exec_depend>libqt5-widgets</exec_depend>
+
+  <export>
+    <rviz plugin="${prefix}/plugin_description.xml"/>
+  </export>
+</package>

@@ -1,0 +1,10 @@
+<library path="lib/libminimum_snap_planner">
+  <class name="minimum_snap_planner/WaypointSnapPlanner" 
+         type="minimum_snap_planner::MinimumSnapPlanner" 
+         base_class_type="nav_core::BaseGlobalPlanner">
+    <description>
+      Costmap-aware multi-waypoint planner combining Navigation A* with Minimum Snap smoothing
+    </description>
+  </class>
+</library>
+
