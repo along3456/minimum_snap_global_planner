@@ -1,0 +1,501 @@
+#include "minimum_snap_planner/minimum_snap_planner.h"
+#include <algorithm>
+#include <cmath>
+#include <cctype>
+#include <pluginlib/class_list_macros.h>
+#include <tf2/utils.h>
+
+PLUGINLIB_EXPORT_CLASS(minimum_snap_planner::MinimumSnapPlanner, nav_core::BaseGlobalPlanner)
+
+namespace minimum_snap_planner
+{
+
+MinimumSnapPlanner::MinimumSnapPlanner()
+    : costmap_ros_(nullptr)
+    , costmap_(nullptr)
+    , global_planner_(nullptr)
+    , minimum_snap_ptr_(nullptr)
+    , pending_waypoints_available_(false)
+    , initialized_(false)
+    , waypoint_reached_tolerance_(0.3)
+    , use_covariance_pose_(true)
+{
+}
+
+MinimumSnapPlanner::MinimumSnapPlanner(std::string name, costmap_2d::Costmap2DROS* costmap_ros)
+    : costmap_ros_(nullptr)
+    , costmap_(nullptr)
+    , global_planner_(nullptr)
+    , minimum_snap_ptr_(nullptr)
+    , pending_waypoints_available_(false)
+    , initialized_(false)
+    , waypoint_reached_tolerance_(0.3)
+    , use_covariance_pose_(true)
+{
+    initialize(name, costmap_ros);
+}
+
+MinimumSnapPlanner::~MinimumSnapPlanner()
+{
+}
+
+void MinimumSnapPlanner::initialize(std::string name, costmap_2d::Costmap2DROS* costmap_ros)
+{
+    if (!initialized_)
+    {
+        costmap_ros_ = costmap_ros;
+        costmap_ = costmap_ros_->getCostmap();
+        global_frame_ = costmap_ros_->getGlobalFrameID();
+
+        ros::NodeHandle private_nh("~/" + name);
+        
+        // Load parameters
+        private_nh.param("downsample_resolution", downsample_resolution_, 0.5);
+        private_nh.param("max_vel", max_vel_, 1.0);
+        private_nh.param("max_accel", max_accel_, 1.0);
+        int poly_order_int = 3;
+        private_nh.param("polynomial_order", poly_order_int, 3);
+        polynomial_order_ = static_cast<unsigned int>(poly_order_int);
+        private_nh.param("trajectory_time_step", trajectory_time_step_, 0.01);
+        private_nh.param("waypoint_topic", waypoint_topic_, std::string("/waypoints"));
+        private_nh.param("waypoint_feedback_topic", waypoint_feedback_topic_,
+                         waypoint_topic_ + std::string("/feedback"));
+        private_nh.param("robot_pose_topic", robot_pose_topic_, std::string("/amcl_pose"));
+        private_nh.param("robot_pose_type", robot_pose_type_, std::string("pose_with_covariance"));
+        private_nh.param("waypoint_reached_tolerance", waypoint_reached_tolerance_, 0.3);
+
+        std::transform(robot_pose_type_.begin(), robot_pose_type_.end(),
+                       robot_pose_type_.begin(), ::tolower);
+        use_covariance_pose_ = (robot_pose_type_ != "pose");
+
+        ROS_INFO("[MinimumSnapPlanner] Parameters loaded:");
+        ROS_INFO("  - downsample_resolution: %.2f", downsample_resolution_);
+        ROS_INFO("  - max_vel: %.2f", max_vel_);
+        ROS_INFO("  - max_accel: %.2f", max_accel_);
+        ROS_INFO("  - polynomial_order: %u", polynomial_order_);
+        ROS_INFO("  - waypoint_topic: %s", waypoint_topic_.c_str());
+        ROS_INFO("  - waypoint_feedback_topic: %s", waypoint_feedback_topic_.c_str());
+        ROS_INFO("  - robot_pose_topic: %s (%s)", robot_pose_topic_.c_str(), robot_pose_type_.c_str());
+        ROS_INFO("  - waypoint_reached_tolerance: %.2f", waypoint_reached_tolerance_);
+
+        // Initialize helper global planner (cost-aware A*)
+        global_planner_ = std::make_shared<global_planner::GlobalPlanner>();
+        global_planner_->initialize(name + "_costaware_segments", costmap_ros_);
+
+        // Initialize Minimum Snap trajectory generator
+        minimum_snap_ptr_ = std::make_shared<MinimumSnap>(
+            polynomial_order_, max_vel_, max_accel_);
+
+        // Subscribe to waypoints
+        ros::NodeHandle nh;
+        waypoint_sub_ = nh.subscribe(waypoint_topic_, 1, 
+                                     &MinimumSnapPlanner::waypointCallback, this);
+        
+        plan_pub_ = private_nh.advertise<nav_msgs::Path>("global_plan", 1);
+
+        if (!waypoint_feedback_topic_.empty())
+        {
+            waypoint_feedback_pub_ = nh.advertise<geometry_msgs::PoseArray>(waypoint_feedback_topic_, 1, true);
+        }
+
+        if (!robot_pose_topic_.empty())
+        {
+            if (use_covariance_pose_)
+            {
+                robot_pose_cov_sub_ = nh.subscribe(robot_pose_topic_, 1,
+                    &MinimumSnapPlanner::robotPoseCovCallback, this);
+            }
+            else
+            {
+                robot_pose_sub_ = nh.subscribe(robot_pose_topic_, 1,
+                    &MinimumSnapPlanner::robotPoseCallback, this);
+            }
+        }
+        else
+        {
+            ROS_WARN("[MinimumSnapPlanner] Robot pose topic not set. Waypoint auto-clearing disabled.");
+        }
+
+        initialized_ = true;
+        ROS_INFO("[MinimumSnapPlanner] Initialized successfully!");
+    }
+    else
+    {
+        ROS_WARN("[MinimumSnapPlanner] Already initialized!");
+    }
+}
+
+void MinimumSnapPlanner::waypointCallback(const geometry_msgs::PoseArray::ConstPtr& msg)
+{
+    std::lock_guard<std::mutex> lock(waypoint_mutex_);
+    pending_waypoints_.assign(msg->poses.begin(), msg->poses.end());
+    pending_waypoints_available_ = true;
+
+    ROS_INFO("[MinimumSnapPlanner] Received %lu pending waypoints", pending_waypoints_.size());
+}
+
+bool MinimumSnapPlanner::makePlan(const geometry_msgs::PoseStamped& start,
+                                   const geometry_msgs::PoseStamped& goal,
+                                   std::vector<geometry_msgs::PoseStamped>& plan)
+{
+    if (!initialized_)
+    {
+        ROS_ERROR("[MinimumSnapPlanner] Planner not initialized!");
+        return false;
+    }
+
+    plan.clear();
+
+    ROS_INFO("[MinimumSnapPlanner] Planning from (%.2f, %.2f) to (%.2f, %.2f)",
+             start.pose.position.x, start.pose.position.y,
+             goal.pose.position.x, goal.pose.position.y);
+
+    // Load the waypoint set that should be applied for this navigation request
+    std::vector<geometry_msgs::Pose> active_waypoints = loadWaypointsForGoal(goal);
+    ROS_INFO("[MinimumSnapPlanner] Using %lu waypoint(s) for this plan", active_waypoints.size());
+
+    std::vector<geometry_msgs::PoseStamped> waypoint_stamped;
+    waypoint_stamped.reserve(active_waypoints.size());
+    for (const auto& pose : active_waypoints)
+    {
+        geometry_msgs::PoseStamped wp;
+        wp.header.frame_id = global_frame_;
+        wp.header.stamp = ros::Time::now();
+        wp.pose = pose;
+        waypoint_stamped.push_back(wp);
+    }
+
+    // Multi-segment cost-aware planning
+    std::vector<Eigen::Vector2d> all_path_points;
+    if (!planMultiSegmentPath(start, waypoint_stamped, goal, all_path_points))
+    {
+        ROS_ERROR("[MinimumSnapPlanner] Multi-segment cost-aware planning failed!");
+        return false;
+    }
+
+    ROS_INFO("[MinimumSnapPlanner] Total A* path points: %lu", all_path_points.size());
+
+    if (all_path_points.size() < 2)
+    {
+        ROS_ERROR("[MinimumSnapPlanner] Not enough path points!");
+        return false;
+    }
+
+    // Downsample path
+    std::vector<Eigen::Vector2d> downsampled_path = downsamplePath(all_path_points, downsample_resolution_);
+    
+    ROS_INFO("[MinimumSnapPlanner] Downsampled to %lu points", downsampled_path.size());
+
+    if (downsampled_path.size() < 2)
+    {
+        ROS_ERROR("[MinimumSnapPlanner] Not enough points after downsampling!");
+        return false;
+    }
+
+    // Generate smooth trajectory using Minimum Snap
+    bool success = generateMinimumSnapTrajectory(downsampled_path, plan);
+    
+    if (!success)
+    {
+        ROS_ERROR("[MinimumSnapPlanner] Failed to generate Minimum Snap trajectory!");
+        return false;
+    }
+
+    if (!plan.empty())
+    {
+        plan.back().pose.orientation = goal.pose.orientation;
+    }
+
+    ROS_INFO("[MinimumSnapPlanner] Generated plan with %lu points", plan.size());
+
+    // Publish plan for visualization
+    if (plan_pub_.getNumSubscribers() > 0)
+    {
+        nav_msgs::Path path_msg;
+        path_msg.header.frame_id = global_frame_;
+        path_msg.header.stamp = ros::Time::now();
+        path_msg.poses = plan;
+        plan_pub_.publish(path_msg);
+    }
+
+    return true;
+}
+
+std::vector<Eigen::Vector2d> MinimumSnapPlanner::downsamplePath(
+    const std::vector<Eigen::Vector2d>& path,
+    double resolution)
+{
+    if (path.size() <= 2)
+    {
+        return path;
+    }
+
+    std::vector<Eigen::Vector2d> downsampled;
+    downsampled.push_back(path.front());  // Always keep start
+    
+    double accumulated_dist = 0.0;
+    
+    for (size_t i = 1; i < path.size() - 1; ++i)
+    {
+        double dist = (path[i] - path[i-1]).norm();
+        accumulated_dist += dist;
+        
+        if (accumulated_dist >= resolution)
+        {
+            downsampled.push_back(path[i]);
+            accumulated_dist = 0.0;
+        }
+    }
+    
+    downsampled.push_back(path.back());  // Always keep goal
+    
+    return downsampled;
+}
+
+bool MinimumSnapPlanner::generateMinimumSnapTrajectory(
+    const std::vector<Eigen::Vector2d>& waypoints,
+    std::vector<geometry_msgs::PoseStamped>& plan)
+{
+    if (waypoints.size() < 2)
+    {
+        return false;
+    }
+
+    // Convert waypoints to matrix format
+    unsigned int num_waypoints = waypoints.size();
+    MatXd waypoint_matrix = MatXd::Zero(num_waypoints, 2);
+    
+    for (unsigned int i = 0; i < num_waypoints; ++i)
+    {
+        waypoint_matrix(i, 0) = waypoints[i].x();
+        waypoint_matrix(i, 1) = waypoints[i].y();
+    }
+
+    // Allocate time for each segment
+    VecXd segment_times = minimum_snap_ptr_->AllocateTime(waypoint_matrix);
+    
+    // Initialize velocity and acceleration (zero at start and end)
+    VecXd waypoint_vel = VecXd::Zero(num_waypoints);
+    VecXd waypoint_accel = VecXd::Zero(num_waypoints);
+
+    // Solve for polynomial coefficients in x and y directions
+    MatXd poly_coeff_x = minimum_snap_ptr_->SolveQPClosedForm(
+        waypoint_matrix.col(0), waypoint_vel, waypoint_accel, segment_times);
+    
+    MatXd poly_coeff_y = minimum_snap_ptr_->SolveQPClosedForm(
+        waypoint_matrix.col(1), waypoint_vel, waypoint_accel, segment_times);
+
+    unsigned int num_segments = segment_times.size();
+
+    // Generate trajectory points
+    for (unsigned int seg = 0; seg < num_segments; ++seg)
+    {
+        double segment_time = segment_times(seg);
+        
+        for (double t = 0.0; t < segment_time; t += trajectory_time_step_)
+        {
+            geometry_msgs::PoseStamped pose;
+            pose.header.frame_id = global_frame_;
+            pose.header.stamp = ros::Time::now();
+            
+            // Evaluate polynomial at time t
+            VecXd coeff_x = poly_coeff_x.row(seg);
+            VecXd coeff_y = poly_coeff_y.row(seg);
+            
+            pose.pose.position.x = evaluatePolynomial(coeff_x, t);
+            pose.pose.position.y = evaluatePolynomial(coeff_y, t);
+            pose.pose.position.z = 0.0;
+            
+            // Calculate orientation from trajectory direction
+            if (!plan.empty())
+            {
+                double dx = pose.pose.position.x - plan.back().pose.position.x;
+                double dy = pose.pose.position.y - plan.back().pose.position.y;
+                double yaw = atan2(dy, dx);
+                
+                tf2::Quaternion q;
+                q.setRPY(0, 0, yaw);
+                pose.pose.orientation.x = q.x();
+                pose.pose.orientation.y = q.y();
+                pose.pose.orientation.z = q.z();
+                pose.pose.orientation.w = q.w();
+            }
+            else
+            {
+                pose.pose.orientation.w = 1.0;
+            }
+            
+            plan.push_back(pose);
+        }
+    }
+    
+    // Add final point
+    if (!plan.empty() && num_waypoints > 0)
+    {
+        geometry_msgs::PoseStamped final_pose;
+        final_pose.header.frame_id = global_frame_;
+        final_pose.header.stamp = ros::Time::now();
+        final_pose.pose.position.x = waypoints.back().x();
+        final_pose.pose.position.y = waypoints.back().y();
+        final_pose.pose.position.z = 0.0;
+        
+        if (plan.size() > 1)
+        {
+            final_pose.pose.orientation = plan.back().pose.orientation;
+        }
+        else
+        {
+            final_pose.pose.orientation.w = 1.0;
+        }
+        
+        plan.push_back(final_pose);
+    }
+
+    return true;
+}
+
+double MinimumSnapPlanner::evaluatePolynomial(const VecXd& coeffs, double t)
+{
+    double result = 0.0;
+    unsigned int n = coeffs.size();
+    
+    // Coefficients are stored in reverse order (highest degree first)
+    for (unsigned int i = 0; i < n; ++i)
+    {
+        double power = (i == 0) ? 1.0 : std::pow(t, i);
+        result += coeffs(n - 1 - i) * power;
+    }
+    
+    return result;
+}
+
+bool MinimumSnapPlanner::planMultiSegmentPath(
+    const geometry_msgs::PoseStamped& start,
+    const std::vector<geometry_msgs::PoseStamped>& waypoints,
+    const geometry_msgs::PoseStamped& goal,
+    std::vector<Eigen::Vector2d>& out_points)
+{
+    out_points.clear();
+
+    if (!global_planner_)
+    {
+        ROS_ERROR("[MinimumSnapPlanner] Global planner helper is not initialized.");
+        return false;
+    }
+
+    std::vector<geometry_msgs::PoseStamped> sequence;
+    sequence.reserve(waypoints.size() + 2);
+    sequence.push_back(start);
+    sequence.insert(sequence.end(), waypoints.begin(), waypoints.end());
+    sequence.push_back(goal);
+
+    if (sequence.size() < 2)
+    {
+        ROS_WARN("[MinimumSnapPlanner] Planning sequence must contain at least start and goal.");
+        return false;
+    }
+
+    bool include_first_point = true;
+    std::vector<geometry_msgs::PoseStamped> segment_plan;
+
+    for (size_t i = 0; i < sequence.size() - 1; ++i)
+    {
+        segment_plan.clear();
+
+        geometry_msgs::PoseStamped segment_start = sequence[i];
+        geometry_msgs::PoseStamped segment_goal = sequence[i + 1];
+        segment_start.header.stamp = ros::Time::now();
+        segment_goal.header.stamp = ros::Time::now();
+
+        ROS_INFO("[MinimumSnapPlanner] Cost-aware segment %lu: (%.2f, %.2f) -> (%.2f, %.2f)",
+                 i,
+                 segment_start.pose.position.x, segment_start.pose.position.y,
+                 segment_goal.pose.position.x, segment_goal.pose.position.y);
+
+        if (!global_planner_->makePlan(segment_start, segment_goal, segment_plan) || segment_plan.size() < 2)
+        {
+            ROS_ERROR("[MinimumSnapPlanner] Global planner failed for segment %lu.", i);
+            return false;
+        }
+
+        size_t start_idx = include_first_point ? 0 : 1;
+        for (size_t j = start_idx; j < segment_plan.size(); ++j)
+        {
+            out_points.emplace_back(segment_plan[j].pose.position.x,
+                                    segment_plan[j].pose.position.y);
+        }
+
+        include_first_point = false;
+    }
+
+    return !out_points.empty();
+}
+
+std::vector<geometry_msgs::Pose> MinimumSnapPlanner::loadWaypointsForGoal(const geometry_msgs::PoseStamped& goal)
+{
+    std::lock_guard<std::mutex> lock(waypoint_mutex_);
+    if (pending_waypoints_available_)
+    {
+        active_waypoints_ = pending_waypoints_;
+        pending_waypoints_.clear();
+        pending_waypoints_available_ = false;
+    }
+    return active_waypoints_;
+}
+
+void MinimumSnapPlanner::robotPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
+{
+    handleRobotPose(msg->pose);
+}
+
+void MinimumSnapPlanner::robotPoseCovCallback(
+    const geometry_msgs::PoseWithCovarianceStamped::ConstPtr& msg)
+{
+    handleRobotPose(msg->pose.pose);
+}
+
+void MinimumSnapPlanner::handleRobotPose(const geometry_msgs::Pose& pose)
+{
+    if (waypoint_reached_tolerance_ <= 0.0)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(waypoint_mutex_);
+
+    if (active_waypoints_.empty())
+    {
+        return;
+    }
+
+    const geometry_msgs::Pose& target = active_waypoints_.front();
+    double dx = pose.position.x - target.position.x;
+    double dy = pose.position.y - target.position.y;
+    double dz = pose.position.z - target.position.z;
+    double distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+    if (distance <= waypoint_reached_tolerance_)
+    {
+        active_waypoints_.erase(active_waypoints_.begin());
+        ROS_INFO("[MinimumSnapPlanner] Waypoint reached. Remaining: %lu",
+                 active_waypoints_.size());
+        publishActiveWaypointsLocked();
+    }
+}
+
+void MinimumSnapPlanner::publishActiveWaypointsLocked()
+{
+    if (!waypoint_feedback_pub_)
+    {
+        return;
+    }
+
+    geometry_msgs::PoseArray pose_array;
+    pose_array.header.frame_id = global_frame_;
+    pose_array.header.stamp = ros::Time::now();
+    pose_array.poses = active_waypoints_;
+    waypoint_feedback_pub_.publish(pose_array);
+}
+
+} // namespace minimum_snap_planner
+

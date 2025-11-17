@@ -1,0 +1,9 @@
+<library path="lib/libwaypoint_tool">
+  <class name="minimum_snap_global_planner/WaypointTool"
+         type="rviz::WaypointTool"
+         base_class_type="rviz::Tool">
+    <description>
+      Tool for setting waypoints
+    </description>
+  </class>
+</library>

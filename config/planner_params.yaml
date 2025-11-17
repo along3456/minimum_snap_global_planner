@@ -1,0 +1,28 @@
+MinimumSnapPlanner:
+  # A*路径点下采样分辨率(米)，值越小越密集，轨迹更平滑但计算量更大
+  downsample_resolution: 0.5
+  
+  # 轨迹生成允许的最大速度(米/秒)
+  max_vel: 1.0
+  
+  # 轨迹生成允许的最大加速度(米/秒^2)
+  max_accel: 1.0
+  
+  # 多项式阶数(2=控制加速度，3=控制加加速度，4=控制snap)
+  polynomial_order: 3
+  
+  # 轨迹离散采样的时间步长(秒)
+  trajectory_time_step: 0.01
+  
+  # 接收航点PoseArray的主题
+  waypoint_topic: "/waypoints"
+
+  # 将规划器侧航点列表回传到RViz的主题
+  waypoint_feedback_topic: "/waypoints/feedback"
+
+  # 机器人位姿话题(及数据类型，pose或pose_with_covariance)
+  robot_pose_topic: "/amcl_pose"
+  robot_pose_type: "pose_with_covariance"
+
+  # 判定机器人抵达航点的距离阈值(米)
+  waypoint_reached_tolerance: 0.35
